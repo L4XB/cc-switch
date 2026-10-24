@@ -1302,6 +1302,7 @@ fn merge_additive_config(
         if let Some(api_key) = config
             .get("apiKey")
             .or_else(|| config.get("api_key"))
+            .or_else(|| config.get("options").and_then(|o| o.get("apiKey")))
             .and_then(|v| v.as_str())
         {
             request.api_key = Some(api_key.to_string());

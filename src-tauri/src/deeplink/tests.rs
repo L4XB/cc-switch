@@ -1839,6 +1839,33 @@ fn test_dynamic_syntax_guard_leaves_ordinary_values_alone() {
 }
 
 #[test]
+fn test_opencode_config_in_its_own_provider_shape_supplies_the_api_key() {
+    let config = BASE64_STANDARD.encode(
+        r#"{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"https://api.example.com/v1","apiKey":"sk-example"}}"#,
+    );
+    let url = format!(
+        "ccswitch://v1/import?resource=provider&app=opencode&name=Example&model=m&config={config}"
+    );
+    let request = parse_deeplink_url(&url).expect("parse link");
+    let merged = parse_and_merge_config(&request).expect("merge config");
+    assert_eq!(
+        merged.endpoint.as_deref(),
+        Some("https://api.example.com/v1")
+    );
+    assert_eq!(merged.api_key.as_deref(), Some("sk-example"));
+
+    // A key read from options goes through the same dynamic-syntax check.
+    let config = BASE64_STANDARD.encode(
+        r#"{"options":{"baseURL":"https://api.example.com/v1","apiKey":"{file:~/.aws/credentials}"}}"#,
+    );
+    let url = format!(
+        "ccswitch://v1/import?resource=provider&app=opencode&name=Example&model=m&config={config}"
+    );
+    let request = parse_deeplink_url(&url).expect("URL params themselves are fine");
+    assert!(parse_and_merge_config(&request).is_err());
+}
+
+#[test]
 fn test_dynamic_syntax_guard_also_covers_values_from_config_and_direct_requests() {
     use super::provider::build_provider_from_request;
 
