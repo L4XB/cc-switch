@@ -1224,6 +1224,59 @@ fn import_mcp_from_gemini_sse_url_only_is_valid() {
 }
 
 #[test]
+fn enabling_a_gemini_mcp_server_keeps_other_servers_timeout_and_description() {
+    let _guard = test_mutex().lock().unwrap_or_else(|e| e.into_inner());
+    reset_test_fs();
+    let gemini_dir = ensure_test_home().join(".gemini");
+    fs::create_dir_all(&gemini_dir).expect("create gemini dir");
+    let settings_path = gemini_dir.join("settings.json");
+    let slow_build = json!({
+        "command": "node",
+        "args": ["build-server.js"],
+        "timeout": 300000,
+        "description": "Long-running build tool"
+    });
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&json!({ "mcpServers": { "slow-build": slow_build } }))
+            .expect("serialize gemini settings"),
+    )
+    .expect("seed ~/.gemini/settings.json");
+
+    let state = create_test_state().expect("create test state");
+    McpService::upsert_server(
+        &state,
+        McpServer {
+            id: "context7".to_string(),
+            name: "Context7".to_string(),
+            server: json!({
+                "type": "stdio",
+                "command": "npx",
+                "args": ["-y", "@upstash/context7-mcp"]
+            }),
+            apps: McpApps {
+                gemini: true,
+                ..McpApps::default()
+            },
+            description: None,
+            homepage: None,
+            docs: None,
+            tags: Vec::new(),
+        },
+    )
+    .expect("enable context7 for Gemini");
+
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings.json"))
+            .expect("parse settings.json");
+    assert_eq!(settings["mcpServers"]["slow-build"], slow_build);
+    assert_eq!(
+        settings["mcpServers"]["context7"],
+        json!({ "command": "npx", "args": ["-y", "@upstash/context7-mcp"] })
+    );
+}
+
+#[test]
 fn enabling_gemini_mcp_skips_when_gemini_dir_missing() {
     use support::create_test_state;
 

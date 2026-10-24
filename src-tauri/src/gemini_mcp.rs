@@ -120,17 +120,12 @@ pub fn set_mcp_servers_map(
         obj.remove("source");
         obj.remove("id");
         obj.remove("name");
-        obj.remove("description");
         obj.remove("tags");
         obj.remove("homepage");
         obj.remove("docs");
 
         // Timeout 转换：Claude/Codex 使用 startup_timeout_sec/tool_timeout_sec
         // Gemini CLI 只支持 timeout（单位 ms）
-        // 默认值：startup=10s, tool=60s
-        const DEFAULT_STARTUP_MS: u64 = 10_000;
-        const DEFAULT_TOOL_MS: u64 = 60_000;
-
         let extract_timeout =
             |obj: &mut Map<String, Value>, key: &str, multiplier: u64| -> Option<u64> {
                 obj.remove(key).and_then(|val| {
@@ -140,17 +135,18 @@ pub fn set_mcp_servers_map(
                 })
             };
 
-        // 分别收集 startup 和 tool timeout，未设置时使用默认值
         let startup_ms = extract_timeout(&mut obj, "startup_timeout_sec", 1000)
-            .or_else(|| extract_timeout(&mut obj, "startup_timeout_ms", 1))
-            .unwrap_or(DEFAULT_STARTUP_MS);
+            .or_else(|| extract_timeout(&mut obj, "startup_timeout_ms", 1));
         let tool_ms = extract_timeout(&mut obj, "tool_timeout_sec", 1000)
-            .or_else(|| extract_timeout(&mut obj, "tool_timeout_ms", 1))
-            .unwrap_or(DEFAULT_TOOL_MS);
+            .or_else(|| extract_timeout(&mut obj, "tool_timeout_ms", 1));
 
-        // 取最大值作为 Gemini timeout
-        let final_timeout = startup_ms.max(tool_ms);
-        obj.insert("timeout".to_string(), Value::Number(final_timeout.into()));
+        // A server's own `timeout` stays. Without one and without a timeout to convert, Gemini CLI
+        // uses its default (10 minutes), so nothing is written.
+        if !obj.contains_key("timeout") {
+            if let Some(timeout) = startup_ms.max(tool_ms) {
+                obj.insert("timeout".to_string(), Value::Number(timeout.into()));
+            }
+        }
 
         out.insert(id.clone(), Value::Object(obj));
     }
