@@ -821,6 +821,14 @@ impl SkillService {
                 && existing.repo_name.as_deref() == Some(&skill.repo_name);
             if same_repo {
                 let mut updated = existing.clone();
+                if !updated.apps.is_enabled_for(current_app) {
+                    let directory = Self::require_valid_directory(&updated.directory)?;
+                    Self::preflight_install_destination(
+                        &Self::get_ssot_dir()?.join(&directory),
+                        &directory,
+                        current_app,
+                    )?;
+                }
                 updated.apps.set_enabled_for(current_app, true);
                 db.save_skill(&updated)?;
                 Self::sync_to_app_dir(&updated.directory, current_app)?;
@@ -2149,6 +2157,7 @@ impl SkillService {
                 restore_path.display()
             ));
         }
+        Self::preflight_install_destination(&backup_skill_dir, &directory, current_app)?;
 
         let mut restored_skill = metadata.skill;
         restored_skill.directory = directory;
@@ -2233,6 +2242,17 @@ impl SkillService {
                 return Err(error);
             }
             return Ok(());
+        }
+
+        // Enabling an app the Skill is not enabled for yet deploys it there for the first
+        // time, so the destination is checked like an install.
+        if enabled && !skill.apps.is_enabled_for(app) {
+            let directory = Self::require_valid_directory(&skill.directory)?;
+            Self::preflight_install_destination(
+                &Self::get_ssot_dir()?.join(&directory),
+                &directory,
+                app,
+            )?;
         }
 
         // 更新状态
@@ -2556,15 +2576,23 @@ impl SkillService {
     fn preflight_install_destination(source: &Path, directory: &str, app: &AppType) -> Result<()> {
         let ssot_dir = Self::get_ssot_dir()?;
         let app_dir = Self::get_distinct_app_skills_dir(&ssot_dir, app)?;
-        if !matches!(
-            app,
-            AppType::Pi | AppType::Omp | AppType::Mcode | AppType::Agy | AppType::Kimi
-        ) {
+        if !Self::is_sync_managed_app(app) && !matches!(app, AppType::Pi | AppType::Omp) {
             return Ok(());
         }
         let destination = app_dir.join(directory);
         if destination.exists() || Self::is_symlink(&destination) {
-            Self::ensure_pi_skill_destination_matches(source, &destination, directory)?;
+            if matches!(
+                app,
+                AppType::Pi | AppType::Omp | AppType::Mcode | AppType::Agy | AppType::Kimi
+            ) {
+                Self::ensure_pi_skill_destination_matches(source, &destination, directory)?;
+            } else if Self::inspect_pi_skill_destination(source, &destination, directory).is_err() {
+                // The other apps' skills directories follow the same content match, so a
+                // same-named directory that CC Switch did not deploy is never replaced.
+                return Err(anyhow!(
+                    "{app:?} 中已存在同名但内容不同的 Skill，拒绝覆盖: {directory}"
+                ));
+            }
         }
         Ok(())
     }
@@ -8003,6 +8031,203 @@ mod tests {
         assert!(result.installed.is_empty());
         assert_eq!(result.skipped.len(), 1);
         assert_eq!(result.skipped[0].existing_id, "local:fresh");
+    }
+
+    /// The user's own `review` Skill in `app`'s skills directory, never deployed by CC Switch.
+    fn write_own_review_skill(app: &AppType) -> PathBuf {
+        let own = SkillService::get_app_skills_dir(app)
+            .unwrap()
+            .join("review");
+        write_skill(&own, "my own review");
+        fs::write(own.join("checklist-notes.md"), "my notes").expect("write notes");
+        own
+    }
+
+    fn assert_own_review_skill_kept(own: &Path) {
+        assert!(fs::read_to_string(own.join("SKILL.md"))
+            .expect("own SKILL.md")
+            .contains("my own review"));
+        assert_eq!(
+            fs::read_to_string(own.join("checklist-notes.md")).expect("own notes"),
+            "my notes"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_from_zip_keeps_a_same_name_app_skill_it_did_not_deploy() {
+        for app in [AppType::Claude, AppType::Codex] {
+            let home = tempdir().expect("home");
+            let _home = TestHomeGuard::set(home.path());
+            let db = Arc::new(Database::memory().expect("memory db"));
+            let own = write_own_review_skill(&app);
+            let zip_path = home.path().join("pack.zip");
+            fs::write(&zip_path, build_skills_zip(&["review"])).expect("write zip");
+
+            let err = SkillService::install_from_zip(&db, &zip_path, &app)
+                .expect_err("the app's own review Skill must not be replaced");
+
+            assert!(err.to_string().contains("review"), "{app:?}: {err}");
+            assert_own_review_skill_kept(&own);
+            assert!(db.get_all_installed_skills().unwrap().is_empty());
+            assert!(!SkillService::get_ssot_dir()
+                .unwrap()
+                .join("review")
+                .exists());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn toggle_app_keeps_a_same_name_app_skill_it_did_not_deploy() {
+        for app in [AppType::Claude, AppType::Codex] {
+            let home = tempdir().expect("home");
+            let _home = TestHomeGuard::set(home.path());
+            let db = Arc::new(Database::memory().expect("memory db"));
+            let skill = poisoned_skill("owner/repo:review", "review");
+            db.save_skill(&skill).expect("save skill");
+            let managed = SkillService::get_ssot_dir().unwrap().join("review");
+            write_skill(&managed, "review");
+            let own = write_own_review_skill(&app);
+
+            let err = SkillService::toggle_app(&db, &skill.id, &app, true)
+                .expect_err("enabling must not replace the app's own review Skill");
+
+            assert!(err.to_string().contains("review"), "{app:?}: {err}");
+            assert_own_review_skill_kept(&own);
+            let saved = db.get_installed_skill(&skill.id).unwrap().unwrap();
+            assert!(!saved.apps.is_enabled_for(&app), "{app:?}");
+
+            // A copy identical to the managed one counts as CC Switch's, as it does for Pi.
+            fs::remove_dir_all(&own).expect("remove own skill");
+            SkillService::copy_dir_recursive(&managed, &own).expect("copy managed skill");
+            SkillService::toggle_app(&db, &skill.id, &app, true).expect("enable over own copy");
+            let saved = db.get_installed_skill(&skill.id).unwrap().unwrap();
+            assert!(saved.apps.is_enabled_for(&app), "{app:?}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reinstall_for_another_app_keeps_a_same_name_app_skill_it_did_not_deploy() {
+        let home = tempdir().expect("home");
+        let _home = TestHomeGuard::set(home.path());
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let mut installed = poisoned_skill("owner/repo:review", "review");
+        installed.repo_owner = Some("owner".to_string());
+        installed.repo_name = Some("repo".to_string());
+        installed.apps = SkillApps::only(&AppType::Claude);
+        db.save_skill(&installed).expect("save skill");
+        write_skill(
+            &SkillService::get_ssot_dir().unwrap().join("review"),
+            "review",
+        );
+        let own = write_own_review_skill(&AppType::Codex);
+        let discovered = DiscoverableSkill {
+            key: installed.id.clone(),
+            name: "review".to_string(),
+            description: String::new(),
+            directory: "review".to_string(),
+            readme_url: None,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            repo_branch: "main".to_string(),
+        };
+
+        let err = SkillService::reuse_existing_install(&db, &discovered, "review", &AppType::Codex)
+            .expect_err("installing for Codex must not replace its own review Skill");
+
+        assert!(err.to_string().contains("review"), "{err}");
+        assert_own_review_skill_kept(&own);
+        let saved = db.get_installed_skill(&installed.id).unwrap().unwrap();
+        assert!(!saved.apps.codex);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restore_from_backup_keeps_a_same_name_app_skill_it_did_not_deploy() {
+        let home = tempdir().expect("home");
+        let _home = TestHomeGuard::set(home.path());
+        let backup_id = "20261025_120000_review";
+        let backup_dir = SkillService::get_backup_dir().unwrap().join(backup_id);
+        write_skill(&backup_dir.join("skill"), "review");
+        let metadata = SkillBackupMetadata {
+            skill: poisoned_skill("owner/repo:review", "review"),
+            backup_created_at: 0,
+            source_path: "x".to_string(),
+        };
+        fs::write(
+            backup_dir.join("meta.json"),
+            serde_json::to_string_pretty(&metadata).expect("serialize metadata"),
+        )
+        .expect("write meta.json");
+        let own = write_own_review_skill(&AppType::Claude);
+        let db = Arc::new(Database::memory().expect("memory db"));
+
+        let err = SkillService::restore_from_backup(&db, backup_id, &AppType::Claude)
+            .expect_err("restoring must not replace Claude's own review Skill");
+
+        assert!(err.to_string().contains("review"), "{err}");
+        assert_own_review_skill_kept(&own);
+        assert!(db.get_all_installed_skills().unwrap().is_empty());
+        assert!(!SkillService::get_ssot_dir()
+            .unwrap()
+            .join("review")
+            .exists());
+    }
+
+    /// Only new deployments are checked: the copies CC Switch deployed for the enabled apps are
+    /// still replaced when the Skill is updated.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn update_skill_still_replaces_the_copies_it_deployed() {
+        let home = tempdir().expect("home");
+        let config_dir = home.path().join(".cc-switch");
+        fs::create_dir_all(&config_dir).expect("isolated config directory");
+        // Keep Windows' legacy-HOME fallback out of this destructive test.
+        fs::File::create(config_dir.join("cc-switch.db")).expect("isolated database sentinel");
+        let _home = TestHomeGuard::set(home.path());
+        assert_eq!(crate::config::get_app_config_dir(), config_dir);
+        let _pi_dir = crate::pi_config::test_support::TestAgentDir::new();
+        let remote = tempdir().expect("remote repo");
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let service = SkillService {
+            repo_fixture: Some(remote.path().to_path_buf()),
+        };
+        let mut installed = poisoned_skill("owner/repo:review", "review");
+        installed.repo_owner = Some("owner".to_string());
+        installed.repo_name = Some("repo".to_string());
+        installed.repo_branch = Some("main".to_string());
+        installed.readme_url =
+            SkillService::build_skill_doc_url("owner", "repo", "main", "review/SKILL.md");
+        installed.apps = SkillApps::only(&AppType::Claude);
+        installed.apps.codex = true;
+        db.save_skill(&installed).expect("seed installed skill");
+        let managed = SkillService::get_ssot_dir().unwrap().join("review");
+        write_skill(&managed, "old review");
+        let copies = [AppType::Claude, AppType::Codex].map(|app| {
+            let copy = SkillService::get_app_skills_dir(&app)
+                .unwrap()
+                .join("review");
+            SkillService::copy_dir_recursive(&managed, &copy).expect("deployed copy");
+            copy
+        });
+        write_skill(&remote.path().join("review"), "new review");
+
+        service
+            .update_skill(&db, &installed.id)
+            .await
+            .expect("update skill");
+
+        for copy in copies {
+            assert!(
+                fs::read_to_string(copy.join("SKILL.md"))
+                    .expect("updated copy")
+                    .contains("new review"),
+                "{}",
+                copy.display()
+            );
+        }
     }
 
     #[test]
