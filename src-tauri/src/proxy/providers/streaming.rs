@@ -238,6 +238,49 @@ fn open_block_stop_events(
     events
 }
 
+/// The Anthropic `error` event for an error an upstream sent inside its stream
+/// (a chunk with a top-level `error`, as OpenAI-compatible and Gemini APIs do),
+/// or None when the chunk is not an error.
+pub(crate) fn anthropic_error_event_for_stream_error(chunk: &Value) -> Option<Value> {
+    let error = chunk.get("error").filter(|error| !error.is_null())?;
+    let message = error
+        .get("message")
+        .and_then(|message| message.as_str())
+        .or_else(|| error.as_str())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| error.to_string());
+    let code = error
+        .get("code")
+        .map(|code| match code {
+            Value::String(code) => code.to_ascii_lowercase(),
+            other => other.to_string(),
+        })
+        .unwrap_or_default();
+    let kind = [
+        code.as_str(),
+        error.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+        error.get("status").and_then(|v| v.as_str()).unwrap_or(""),
+    ]
+    .join(" ")
+    .to_ascii_lowercase();
+    let error_type =
+        if code == "429" || kind.contains("rate_limit") || kind.contains("resource_exhausted") {
+            "rate_limit_error"
+        } else if code == "503"
+            || code == "529"
+            || kind.contains("overloaded")
+            || kind.contains("unavailable")
+        {
+            "overloaded_error"
+        } else {
+            "api_error"
+        };
+    Some(json!({
+        "type": "error",
+        "error": { "type": error_type, "message": message }
+    }))
+}
+
 /// 创建 Anthropic SSE 流
 pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -264,9 +307,11 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         let mut tool_blocks_by_index: HashMap<usize, ToolBlockState> = HashMap::new();
         let mut open_tool_block_indices: HashSet<u32> = HashSet::new();
 
+        let mut upstream_error_event: Option<Value> = None;
+
         tokio::pin!(stream);
 
-        while let Some(chunk) = stream.next().await {
+        'chunks: while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
                     crate::proxy::sse::append_utf8_safe(&mut buffer, &mut utf8_remainder, &bytes);
@@ -327,6 +372,21 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                     yield Ok(Bytes::from(sse_data));
                                     // [DONE] is terminal; do not read or emit anything after message_stop.
                                     return;
+                                }
+
+                                // An error the upstream sends inside the stream ends it with an error
+                                // event instead of passing for an ordinary end of turn.
+                                if data.contains("\"error\"") {
+                                    if let Some(event) = serde_json::from_str::<Value>(data)
+                                        .ok()
+                                        .as_ref()
+                                        .and_then(anthropic_error_event_for_stream_error)
+                                    {
+                                        log::warn!("[Claude/OpenRouter] <<< upstream error inside the stream");
+                                        stream_ended_with_error = true;
+                                        upstream_error_event = Some(event);
+                                        break 'chunks;
+                                    }
                                 }
 
                                 if let Ok(chunk) = serde_json::from_str::<OpenAIStreamChunk>(data) {
@@ -793,6 +853,12 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                     yield Ok(Bytes::from(sse_data));
                 }
             }
+        }
+
+        if let Some(event) = upstream_error_event.take() {
+            let sse_data = format!("event: error\ndata: {}\n\n",
+                serde_json::to_string(&event).unwrap_or_default());
+            yield Ok(Bytes::from(sse_data));
         }
 
         // 流自然结束但未收到 [DONE] 时，确保发送缓存的 message_delta 和 message_stop。
@@ -2099,6 +2165,50 @@ mod tests {
             block_boundaries(&events),
             vec!["start:0:tool_use".to_string(), "stop:0".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn upstream_error_inside_the_stream_ends_with_an_error_event() {
+        // OpenRouter's mid-stream error: a chunk with a top-level error and finish_reason "error".
+        let input = concat!(
+            "data: {\"id\":\"gen_1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"Step 1 of 3: first\"}}]}\n\n",
+            "data: {\"id\":\"gen_1\",\"model\":\"m\",\"error\":{\"code\":\"server_error\",\"message\":\"Provider disconnected unexpectedly\"},\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+
+        let events = collect_anthropic_events(input).await;
+        let types: Vec<_> = events.iter().filter_map(event_type).collect();
+
+        assert_eq!(types.last(), Some(&"error"), "{types:?}");
+        assert!(!types.contains(&"message_delta"), "{types:?}");
+        assert!(!types.contains(&"message_stop"), "{types:?}");
+        let error = events.last().unwrap();
+        assert_eq!(error["error"]["type"], "api_error");
+        assert_eq!(
+            error["error"]["message"],
+            "Provider disconnected unexpectedly"
+        );
+        assert!(events
+            .iter()
+            .any(|event| event["delta"]["text"] == "Step 1 of 3: first"));
+    }
+
+    #[tokio::test]
+    async fn bare_upstream_error_chunk_keeps_its_rate_limit_type() {
+        let input = concat!(
+            "data: {\"id\":\"gen_2\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"upstream quota exhausted\",\"type\":\"rate_limit_exceeded\",\"code\":\"429\"}}\n\n"
+        );
+
+        let events = collect_anthropic_events(input).await;
+        let error = events.last().unwrap();
+
+        assert_eq!(event_type(error), Some("error"));
+        assert_eq!(error["error"]["type"], "rate_limit_error");
+        assert_eq!(error["error"]["message"], "upstream quota exhausted");
+        assert!(!events
+            .iter()
+            .any(|event| event_type(event) == Some("message_stop")));
     }
 
     async fn terminal_boundary_output(prefix: String, tail: Option<&str>) -> String {

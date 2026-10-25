@@ -289,6 +289,16 @@ pub fn create_anthropic_sse_stream_from_gemini<E: std::error::Error + Send + 'st
                             Err(_) => continue,
                         };
 
+                        // An error the upstream sends inside the stream ends it with an error
+                        // event instead of passing for an ordinary end of turn.
+                        if let Some(event) =
+                            super::streaming::anthropic_error_event_for_stream_error(&chunk_json)
+                        {
+                            log::warn!("[Claude/Gemini] <<< upstream error inside the stream");
+                            yield Ok(encode_sse("error", &event));
+                            return;
+                        }
+
                         if message_id.is_none() {
                             message_id = chunk_json
                                 .get("responseId")
@@ -642,6 +652,21 @@ mod tests {
         assert!(output.contains("\"text\":\"lo\""));
         assert!(output.contains("\"stop_reason\":\"end_turn\""));
         assert!(output.contains("event: message_stop"));
+    }
+
+    #[test]
+    fn upstream_error_inside_the_stream_ends_with_an_error_event() {
+        let output = collect_stream_output(vec![
+            "data: {\"responseId\":\"resp_3\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"First part\"}]}}]}\n\n",
+            "data: {\"error\":{\"code\":503,\"message\":\"The model is overloaded. Please try again later.\",\"status\":\"UNAVAILABLE\"}}\n\n",
+        ]);
+
+        assert!(output.contains("\"text\":\"First part\""));
+        assert!(output.contains("event: error"));
+        assert!(output.contains("\"type\":\"overloaded_error\""));
+        assert!(output.contains("The model is overloaded. Please try again later."));
+        assert!(!output.contains("\"stop_reason\":\"end_turn\""));
+        assert!(!output.contains("event: message_stop"));
     }
 
     #[test]
