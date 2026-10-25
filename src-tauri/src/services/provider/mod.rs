@@ -4836,6 +4836,155 @@ wire_api = "responses"
         });
     }
 
+    /// A universal provider for Claude, Codex and Gemini, synced to all three apps.
+    fn seed_synced_universal(state: &AppState, id: &str) -> UniversalProvider {
+        let mut universal = UniversalProvider::new(
+            id.to_string(),
+            "Shared".to_string(),
+            "custom".to_string(),
+            "https://api.example".to_string(),
+            "key".to_string(),
+        );
+        universal.apps.claude = true;
+        universal.apps.codex = true;
+        universal.apps.gemini = true;
+        state.db.save_universal_provider(&universal).unwrap();
+        ProviderService::sync_universal_to_apps(state, id).unwrap();
+        universal
+    }
+
+    fn universal_child_exists(state: &AppState, app: &str, id: &str) -> bool {
+        state
+            .db
+            .get_provider_by_id(&format!("universal-{app}-{id}"), app)
+            .unwrap()
+            .is_some()
+    }
+
+    fn add_universal_children_to_stack(state: &AppState, id: &str) {
+        for app_type in [AppType::Claude, AppType::Codex] {
+            let child = format!("universal-{}-{id}", app_type.as_str());
+            futures::executor::block_on(crate::mode::controller::set_stack_member(
+                state, &app_type, &child, true,
+            ))
+            .map_err(|error| error.message)
+            .expect("add the child to the Stack list");
+        }
+    }
+
+    fn universal_children_in_stack(id: &str) -> Vec<String> {
+        [AppType::Claude, AppType::Codex]
+            .iter()
+            .filter(|app_type| {
+                let child = format!("universal-{}-{id}", app_type.as_str());
+                crate::mode::stack::is_member(app_type, &child).unwrap()
+            })
+            .map(|app_type| app_type.as_str().to_string())
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    fn delete_universal_refuses_while_a_child_is_in_use() {
+        with_test_home(|state, _home| {
+            seed_synced_universal(state, "in-use");
+            state
+                .db
+                .set_current_provider("claude", "universal-claude-in-use")
+                .unwrap();
+            crate::settings::set_current_provider(
+                &AppType::Claude,
+                Some("universal-claude-in-use"),
+            )
+            .unwrap();
+
+            let err = ProviderService::delete_universal(state, "in-use")
+                .expect_err("the current Claude child must block the delete");
+
+            assert!(
+                err.to_string().contains("无法删除当前正在使用的供应商"),
+                "{err}"
+            );
+            assert!(state.db.get_universal_provider("in-use").unwrap().is_some());
+            for app in ["claude", "codex", "gemini"] {
+                assert!(universal_child_exists(state, app, "in-use"), "{app}");
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn sync_universal_to_apps_refuses_to_delete_an_in_use_child() {
+        with_test_home(|state, _home| {
+            let mut universal = seed_synced_universal(state, "unchecked");
+            state
+                .db
+                .set_current_provider("codex", "universal-codex-unchecked")
+                .unwrap();
+            crate::settings::set_current_provider(
+                &AppType::Codex,
+                Some("universal-codex-unchecked"),
+            )
+            .unwrap();
+            universal.apps.codex = false;
+            universal.name = "Renamed".to_string();
+            ProviderService::upsert_universal(state, universal).unwrap();
+
+            let err = ProviderService::sync_universal_to_apps(state, "unchecked")
+                .expect_err("unchecking the app of the current child must be refused");
+
+            assert!(
+                err.to_string().contains("无法删除当前正在使用的供应商"),
+                "{err}"
+            );
+            assert!(universal_child_exists(state, "codex", "unchecked"));
+            // Refused before anything is written: the Claude child, synced first, keeps its name.
+            let claude = state
+                .db
+                .get_provider_by_id("universal-claude-unchecked", "claude")
+                .unwrap()
+                .unwrap();
+            assert_eq!(claude.name, "Shared");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn sync_universal_to_apps_removes_unchecked_idle_children_from_the_stack() {
+        with_test_home(|state, _home| {
+            let mut universal = seed_synced_universal(state, "unchecked-idle");
+            add_universal_children_to_stack(state, "unchecked-idle");
+            universal.apps.claude = false;
+            universal.apps.codex = false;
+            ProviderService::upsert_universal(state, universal).unwrap();
+
+            ProviderService::sync_universal_to_apps(state, "unchecked-idle").unwrap();
+
+            assert!(!universal_child_exists(state, "claude", "unchecked-idle"));
+            assert!(!universal_child_exists(state, "codex", "unchecked-idle"));
+            assert!(universal_child_exists(state, "gemini", "unchecked-idle"));
+            assert!(universal_children_in_stack("unchecked-idle").is_empty());
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn delete_universal_removes_idle_children_and_their_stack_membership() {
+        with_test_home(|state, _home| {
+            seed_synced_universal(state, "idle");
+            add_universal_children_to_stack(state, "idle");
+            assert_eq!(universal_children_in_stack("idle"), ["claude", "codex"]);
+
+            assert!(ProviderService::delete_universal(state, "idle").unwrap());
+
+            assert!(state.db.get_universal_provider("idle").unwrap().is_none());
+            for app in ["claude", "codex", "gemini"] {
+                assert!(!universal_child_exists(state, app, "idle"), "{app}");
+            }
+            assert!(universal_children_in_stack("idle").is_empty());
+        });
+    }
+
     #[test]
     #[serial]
     fn add_first_managed_codex_with_missing_account_leaves_no_provider_or_live_state() {
@@ -8396,6 +8545,13 @@ impl ProviderService {
     pub fn delete_universal(state: &AppState, id: &str) -> Result<bool, AppError> {
         // 获取统一供应商（用于删除生成的子供应商）
         let provider = state.db.get_universal_provider(id)?;
+        if let Some(p) = &provider {
+            Self::ensure_universal_children_not_in_use(
+                state,
+                id,
+                [p.apps.claude, p.apps.codex, p.apps.gemini],
+            )?;
+        }
 
         // 删除统一供应商
         state.db.delete_universal_provider(id)?;
@@ -8404,19 +8560,62 @@ impl ProviderService {
         if let Some(p) = provider {
             if p.apps.claude {
                 let claude_id = format!("universal-claude-{id}");
-                let _ = state.db.delete_provider("claude", &claude_id);
+                Self::delete_universal_child(state, AppType::Claude, &claude_id)?;
             }
             if p.apps.codex {
                 let codex_id = format!("universal-codex-{id}");
-                let _ = state.db.delete_provider("codex", &codex_id);
+                Self::delete_universal_child(state, AppType::Codex, &codex_id)?;
             }
             if p.apps.gemini {
                 let gemini_id = format!("universal-gemini-{id}");
-                let _ = state.db.delete_provider("gemini", &gemini_id);
+                Self::delete_universal_child(state, AppType::Gemini, &gemini_id)?;
             }
         }
 
         Ok(true)
+    }
+
+    /// The generated children that are about to be deleted (`deleted` holds the Claude, Codex
+    /// and Gemini flags) must not be in use. The whole operation is refused with the error of
+    /// [`Self::delete`] before anything is deleted, so nothing is left half removed.
+    fn ensure_universal_children_not_in_use(
+        state: &AppState,
+        id: &str,
+        deleted: [bool; 3],
+    ) -> Result<(), AppError> {
+        let apps = [AppType::Claude, AppType::Codex, AppType::Gemini];
+        for (app_type, deleted) in apps.into_iter().zip(deleted) {
+            let child_id = format!("universal-{}-{id}", app_type.as_str());
+            if deleted
+                && state
+                    .db
+                    .get_provider_by_id(&child_id, app_type.as_str())?
+                    .is_some()
+                && crate::mode::current::is_referenced(&state.db, &app_type, &child_id)?
+            {
+                return Err(AppError::Message(
+                    "无法删除当前正在使用的供应商".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Generated children are deleted through [`Self::delete`], so they leave the Stack list
+    /// like any other card. A child that was never generated is skipped.
+    fn delete_universal_child(
+        state: &AppState,
+        app_type: AppType,
+        child_id: &str,
+    ) -> Result<(), AppError> {
+        if state
+            .db
+            .get_provider_by_id(child_id, app_type.as_str())?
+            .is_none()
+        {
+            return Ok(());
+        }
+        Self::delete(state, app_type, child_id)
     }
 
     /// 同步统一供应商到各应用
@@ -8427,6 +8626,17 @@ impl ProviderService {
             .ok_or_else(|| AppError::Message(format!("统一供应商 {id} 不存在")))?;
         // 子供应商经 save_provider 直接入库，不走保存校验，图标在这里把关
         icon::validate_icon(provider.icon.as_deref())?;
+        // An unchecked app's child is deleted below; one that is in use refuses the sync
+        // before any child is written or deleted.
+        Self::ensure_universal_children_not_in_use(
+            state,
+            id,
+            [
+                !provider.apps.claude,
+                !provider.apps.codex,
+                !provider.apps.gemini,
+            ],
+        )?;
 
         // Keep DB and live projections in sync independently per application:
         // one broken config file must not prevent the other two apps from being
@@ -8455,7 +8665,7 @@ impl ProviderService {
         } else {
             // 如果禁用了 Claude，删除对应的子供应商
             let claude_id = format!("universal-claude-{id}");
-            let _ = state.db.delete_provider("claude", &claude_id);
+            Self::delete_universal_child(state, AppType::Claude, &claude_id)?;
         }
 
         // 同步到 Codex
@@ -8479,7 +8689,7 @@ impl ProviderService {
             );
         } else {
             let codex_id = format!("universal-codex-{id}");
-            let _ = state.db.delete_provider("codex", &codex_id);
+            Self::delete_universal_child(state, AppType::Codex, &codex_id)?;
         }
 
         // 同步到 Gemini
@@ -8503,7 +8713,7 @@ impl ProviderService {
             );
         } else {
             let gemini_id = format!("universal-gemini-{id}");
-            let _ = state.db.delete_provider("gemini", &gemini_id);
+            Self::delete_universal_child(state, AppType::Gemini, &gemini_id)?;
         }
 
         if live_failures.is_empty() {
