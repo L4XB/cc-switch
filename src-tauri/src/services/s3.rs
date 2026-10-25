@@ -61,7 +61,9 @@ fn split_scheme_host(endpoint: &str) -> (&str, &str) {
 /// - AWS endpoints use virtual-hosted style: `https://{bucket}.s3.{region}.amazonaws.com/{key}`
 /// - Custom endpoints use path style:       `https://{endpoint}/{bucket}/{key}`
 fn build_object_url(creds: &S3Credentials, key: &str) -> String {
-    let key = key.trim_start_matches('/');
+    // Encode the key as SigV4 canonicalizes it: the signed `url.path()` then matches what S3 checks,
+    // and a `#` or `?` in a profile name stays part of the key instead of ending the path.
+    let key = uri_encode(key.trim_start_matches('/'), false);
     if is_aws_endpoint(&creds.endpoint) {
         format!(
             "https://{}.s3.{}.amazonaws.com/{}",
@@ -647,6 +649,26 @@ mod tests {
     }
 
     // ── HTTP scheme preservation (MinIO support) ──
+
+    #[test]
+    fn build_object_url_encodes_key_characters_outside_sigv4_unreserved() {
+        let creds = test_creds("minio.example.com:9000", "us-east-1", "mybucket");
+        let url = build_object_url(&creds, "cc-switch-sync/v2/db-v6/team#2/db.sql");
+        assert_eq!(
+            url,
+            "https://minio.example.com:9000/mybucket/cc-switch-sync/v2/db-v6/team%232/db.sql"
+        );
+        let parsed = Url::parse(&url).unwrap();
+        assert_eq!(
+            parsed.path(),
+            "/mybucket/cc-switch-sync/v2/db-v6/team%232/db.sql"
+        );
+        assert_eq!(parsed.fragment(), None);
+        assert_eq!(
+            build_object_url(&creds, "root/Lukas's MacBook (work)/manifest.json"),
+            "https://minio.example.com:9000/mybucket/root/Lukas%27s%20MacBook%20%28work%29/manifest.json"
+        );
+    }
 
     #[test]
     fn build_object_url_preserves_http_scheme() {
