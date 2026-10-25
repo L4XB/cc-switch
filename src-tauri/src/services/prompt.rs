@@ -158,47 +158,49 @@ impl PromptService {
         // 回填当前 live 文件内容到已启用的提示词，或创建备份
         let target_path = prompt_file_path(&app)?;
         if target_path.exists() {
-            if let Ok(live_content) = std::fs::read_to_string(&target_path) {
-                if !live_content.trim().is_empty() {
-                    let mut prompts = state.db.get_prompts(app.as_str())?;
+            // A live file that can't be read as UTF-8 (GBK, UTF-16) can't be backed up below,
+            // so refuse rather than overwrite it.
+            let live_content = std::fs::read_to_string(&target_path)
+                .map_err(|error| AppError::io(&target_path, error))?;
+            if !live_content.trim().is_empty() {
+                let mut prompts = state.db.get_prompts(app.as_str())?;
 
-                    // 尝试回填到当前已启用的提示词
-                    if let Some((enabled_id, enabled_prompt)) = prompts
-                        .iter_mut()
-                        .find(|(_, p)| p.enabled)
-                        .map(|(id, p)| (id.clone(), p))
-                    {
-                        let timestamp = get_unix_timestamp()?;
-                        enabled_prompt.content = live_content.clone();
-                        enabled_prompt.updated_at = Some(timestamp);
-                        log::info!("回填 live 提示词内容到已启用项: {enabled_id}");
-                        state.db.save_prompt(app.as_str(), enabled_prompt)?;
-                    } else {
-                        // 没有已启用的提示词，则创建一次备份（避免重复备份）
-                        let content_exists = prompts
-                            .values()
-                            .any(|p| p.content.trim() == live_content.trim());
-                        if !content_exists {
-                            let timestamp = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as i64;
-                            let backup_id = format!("backup-{timestamp}");
-                            let backup_prompt = Prompt {
-                                id: backup_id.clone(),
-                                name: format!(
-                                    "原始提示词 {}",
-                                    chrono::Local::now().format("%Y-%m-%d %H:%M")
-                                ),
-                                content: live_content,
-                                description: Some("自动备份的原始提示词".to_string()),
-                                enabled: false,
-                                created_at: Some(timestamp),
-                                updated_at: Some(timestamp),
-                            };
-                            log::info!("回填 live 提示词内容，创建备份: {backup_id}");
-                            state.db.save_prompt(app.as_str(), &backup_prompt)?;
-                        }
+                // 尝试回填到当前已启用的提示词
+                if let Some((enabled_id, enabled_prompt)) = prompts
+                    .iter_mut()
+                    .find(|(_, p)| p.enabled)
+                    .map(|(id, p)| (id.clone(), p))
+                {
+                    let timestamp = get_unix_timestamp()?;
+                    enabled_prompt.content = live_content.clone();
+                    enabled_prompt.updated_at = Some(timestamp);
+                    log::info!("回填 live 提示词内容到已启用项: {enabled_id}");
+                    state.db.save_prompt(app.as_str(), enabled_prompt)?;
+                } else {
+                    // 没有已启用的提示词，则创建一次备份（避免重复备份）
+                    let content_exists = prompts
+                        .values()
+                        .any(|p| p.content.trim() == live_content.trim());
+                    if !content_exists {
+                        let timestamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        let backup_id = format!("backup-{timestamp}");
+                        let backup_prompt = Prompt {
+                            id: backup_id.clone(),
+                            name: format!(
+                                "原始提示词 {}",
+                                chrono::Local::now().format("%Y-%m-%d %H:%M")
+                            ),
+                            content: live_content,
+                            description: Some("自动备份的原始提示词".to_string()),
+                            enabled: false,
+                            created_at: Some(timestamp),
+                            updated_at: Some(timestamp),
+                        };
+                        log::info!("回填 live 提示词内容，创建备份: {backup_id}");
+                        state.db.save_prompt(app.as_str(), &backup_prompt)?;
                     }
                 }
             }
@@ -638,6 +640,95 @@ mod tests {
             created_at: None,
             updated_at: None,
         }
+    }
+
+    /// Points `CC_SWITCH_TEST_HOME` at a temporary home for one test.
+    struct TestHome(tempfile::TempDir, Option<std::ffi::OsString>);
+    impl TestHome {
+        fn new() -> Self {
+            let home = tempdir().unwrap();
+            let previous = std::env::var_os("CC_SWITCH_TEST_HOME");
+            std::env::set_var("CC_SWITCH_TEST_HOME", home.path());
+            Self(home, previous)
+        }
+    }
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            match self.1.take() {
+                Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+                None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+        }
+    }
+
+    /// Enables `team` over a Claude prompt file (inside `home`) holding `original`.
+    fn enable_over_live_file(
+        home: &TestHome,
+        original: &[u8],
+    ) -> (
+        Result<(), crate::error::AppError>,
+        std::path::PathBuf,
+        IndexMap<String, Prompt>,
+    ) {
+        use super::PromptService;
+        use crate::{app_config::AppType, database::Database, store::AppState};
+
+        let state = AppState::new(std::sync::Arc::new(Database::memory().unwrap()));
+        state
+            .db
+            .save_prompt("claude", &prompt("team", "Team prompt", false))
+            .unwrap();
+        let path = crate::prompt_files::prompt_file_path(&AppType::Claude).unwrap();
+        assert!(path.starts_with(home.0.path()), "{}", path.display());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, original).unwrap();
+        let result = PromptService::enable_prompt(&state, AppType::Claude, "team");
+        (result, path, state.db.get_prompts("claude").unwrap())
+    }
+
+    /// GBK (an ANSI editor or `Set-Content` on Chinese Windows) and UTF-16 (`>` in Windows
+    /// PowerShell 5.1) can't be backed up as a prompt, so enabling refuses and writes nothing.
+    #[test]
+    #[serial_test::serial]
+    fn enable_prompt_refuses_a_live_file_that_is_not_utf8() {
+        let home = TestHome::new();
+        // "我的规则" ("my rules") in GBK
+        let gbk = b"\xCE\xD2\xB5\xC4\xB9\xE6\xD4\xF2: run pnpm test\r\n";
+        let utf16 = [0xFF, 0xFE]
+            .into_iter()
+            .chain(
+                "My rules: run pnpm test\r\n"
+                    .encode_utf16()
+                    .flat_map(|unit| unit.to_le_bytes()),
+            )
+            .collect::<Vec<u8>>();
+        for original in [gbk.to_vec(), utf16] {
+            let (result, path, saved) = enable_over_live_file(&home, &original);
+
+            let error = result.expect_err("a file that isn't UTF-8 must not be overwritten");
+            assert!(
+                error.to_string().contains(&path.display().to_string()),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(saved.len(), 1, "no backup prompt is created either");
+            assert!(!saved["team"].enabled);
+        }
+    }
+
+    /// Control: a UTF-8 file is still kept as a backup prompt before it is replaced.
+    #[test]
+    #[serial_test::serial]
+    fn enable_prompt_backs_up_a_utf8_live_file() {
+        let home = TestHome::new();
+        let (result, path, saved) = enable_over_live_file(&home, b"My rules: run pnpm test\n");
+
+        result.expect("enable over a UTF-8 file");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Team prompt");
+        assert!(saved["team"].enabled);
+        assert!(saved
+            .values()
+            .any(|prompt| !prompt.enabled && prompt.content == "My rules: run pnpm test\n"));
     }
 
     #[test]
