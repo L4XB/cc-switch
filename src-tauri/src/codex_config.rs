@@ -991,6 +991,31 @@ pub fn extract_codex_base_url(config_text: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// The active `[model_providers.<model_provider>].query_params`, which Codex
+/// appends to every request URL (Azure's `api-version`). Empty when the active
+/// table has none, like `extract_codex_base_url` it never reads another table.
+pub fn extract_codex_query_params(config_text: &str) -> Vec<(String, String)> {
+    let Ok(doc) = config_text.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let Some(active_provider) = doc.get("model_provider").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+    doc.get("model_providers")
+        .and_then(|providers| providers.get(active_provider))
+        .and_then(|provider| provider.get("query_params"))
+        .and_then(|params| params.as_table())
+        .map(|params| {
+            params
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn codex_auth_has_login_material(auth: &Value) -> bool {
     let Some(obj) = auth.as_object() else {
         return false;
@@ -3435,6 +3460,31 @@ base_url = "https://other.example.com/v1"
             extract_codex_base_url(top_level).as_deref(),
             Some("https://top-level.example.com/v1")
         );
+    }
+
+    #[test]
+    fn extract_query_params_reads_only_the_active_provider_section() {
+        let input = r#"model_provider = "azure"
+
+[model_providers.azure]
+base_url = "https://my-resource.openai.azure.com/openai"
+query_params = { "api-version" = "2025-04-01-preview" }
+
+[model_providers.other]
+base_url = "https://other.example.com/v1"
+query_params = { "x-other" = "1" }
+"#;
+        assert_eq!(
+            extract_codex_query_params(input),
+            vec![("api-version".to_string(), "2025-04-01-preview".to_string())]
+        );
+
+        let other = input.replace(
+            r#"model_provider = "azure""#,
+            r#"model_provider = "openai""#,
+        );
+        assert!(extract_codex_query_params(&other).is_empty());
+        assert!(extract_codex_query_params("not = [valid").is_empty());
     }
 
     // Mirrors the frontend extractCodexBaseUrl: a non-active provider section

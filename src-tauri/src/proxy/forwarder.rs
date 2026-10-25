@@ -1808,6 +1808,13 @@ impl RequestForwarder {
         } else {
             adapter.build_url(&base_url, &effective_endpoint)
         };
+        // Codex appends the active provider's `query_params` (Azure's `api-version`) to
+        // every request, but the proxy route table does not carry them.
+        let url = if matches!(app_type, AppType::Codex) {
+            append_codex_provider_query_params(url, provider)
+        } else {
+            url
+        };
 
         // 记录映射后的出站模型名（此时 mapped_body 已完成接管映射 / [1m] 剥离 /
         // Copilot 归一化）。格式转换后若 body 仍带 model 字段会在下方刷新覆盖；
@@ -4015,6 +4022,43 @@ fn merge_query_params(base_query: Option<&str>, extra_param: Option<&str>) -> Op
         None
     } else {
         Some(params.join("&"))
+    }
+}
+
+/// Add the Codex provider's configured `query_params` that the request URL does
+/// not already carry.
+fn append_codex_provider_query_params(url: String, provider: &Provider) -> String {
+    let Some(config_text) = provider
+        .settings_config
+        .get("config")
+        .and_then(|config| config.as_str())
+    else {
+        return url;
+    };
+    let configured = crate::codex_config::extract_codex_query_params(config_text);
+    if configured.is_empty() {
+        return url;
+    }
+    let present: Vec<String> = url::Url::parse(&url)
+        .map(|parsed| {
+            parsed
+                .query_pairs()
+                .map(|(key, _)| key.into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    let mut added = false;
+    for (key, value) in configured {
+        if !present.contains(&key) {
+            query.append_pair(&key, &value);
+            added = true;
+        }
+    }
+    if added {
+        append_query_to_full_url(&url, Some(&query.finish()))
+    } else {
+        url
     }
 }
 
@@ -6451,6 +6495,68 @@ mod tests {
         );
         assert_eq!(*captured.lock().await, vec![body]);
         assert_eq!(forwarder.status.read().await.success_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn codex_requests_keep_the_active_providers_query_params() {
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        let app = axum::Router::new().fallback({
+            let seen = seen.clone();
+            move |uri: axum::http::Uri| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().await.push(uri.to_string());
+                    axum::Json(json!({"status": "completed", "output": []}))
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let mut forwarder = test_forwarder(Duration::from_secs(5), Duration::from_secs(5));
+        // The shape of the built-in Azure OpenAI preset.
+        let mut provider = test_provider_with_type(None);
+        provider.settings_config = json!({
+            "auth": {"OPENAI_API_KEY": "azure-key"},
+            "config": format!(
+                "model_provider = \"azure\"\n\n[model_providers.azure]\nname = \"Azure OpenAI\"\nbase_url = \"http://{addr}/openai\"\nwire_api = \"responses\"\nquery_params = {{ \"api-version\" = \"2025-04-01-preview\" }}\n"
+            ),
+        });
+        // Avoid persisting a provider switch outside this in-memory test.
+        forwarder.current_provider_id_at_start = provider.id.clone();
+
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Codex,
+                http::Method::POST,
+                // The endpoint the Codex /v1/responses handler forwards.
+                "/responses",
+                json!({"model": "gpt-5.1-codex", "input": "Hello", "stream": false}),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await;
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+        if let Err(failure) = result {
+            panic!("forward failed: {}", failure.error);
+        }
+        assert_eq!(
+            *seen.lock().await,
+            vec!["/openai/responses?api-version=2025-04-01-preview".to_string()]
+        );
     }
 
     #[test]
