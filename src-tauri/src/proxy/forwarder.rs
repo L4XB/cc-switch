@@ -2724,6 +2724,14 @@ impl RequestForwarder {
         } else {
             self.non_streaming_timeout
         };
+        // Streaming requests wait for the response headers no longer than the first-byte
+        // timeout, on both the reqwest and the raw hyper path.
+        let header_timeout = if request_is_streaming && !self.streaming_first_byte_timeout.is_zero()
+        {
+            self.streaming_first_byte_timeout
+        } else {
+            timeout
+        };
 
         // 获取全局代理 URL（上游是本机地址时直连，不送进代理）
         let upstream_proxy_url: Option<String> = super::http_client::proxy_url_for(&url);
@@ -2762,11 +2770,6 @@ impl RequestForwarder {
             }
             let send = request.body(body_bytes).send();
             let send_result = if request_is_streaming {
-                let header_timeout = if self.streaming_first_byte_timeout.is_zero() {
-                    timeout
-                } else {
-                    self.streaming_first_byte_timeout
-                };
                 tokio::time::timeout(header_timeout, send)
                     .await
                     .map_err(|_| {
@@ -2793,7 +2796,7 @@ impl RequestForwarder {
                 ordered_headers,
                 extensions.clone(),
                 body_bytes,
-                timeout,
+                header_timeout,
                 upstream_proxy_url.as_deref(),
             )
             .await?
@@ -6451,6 +6454,58 @@ mod tests {
         );
         assert_eq!(*captured.lock().await, vec![body]);
         assert_eq!(forwarder.status.read().await.success_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn claude_stream_without_response_headers_fails_at_the_first_byte_timeout() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        // The upstream accepts the request and never answers it.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 16 * 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut request).await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(socket);
+        });
+        let forwarder = test_forwarder(Duration::from_secs(30), Duration::from_secs(1));
+        let mut provider = test_provider_with_type(None);
+        provider.settings_config = json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": format!("http://{addr}"),
+                "ANTHROPIC_AUTH_TOKEN": "sk-third-party",
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let result = forwarder
+            .forward_with_retry(
+                &AppType::Claude,
+                http::Method::POST,
+                "/v1/messages",
+                json!({
+                    "model": "hanging-model",
+                    "max_tokens": 16,
+                    "stream": true,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                }),
+                HeaderMap::new(),
+                Extensions::new(),
+                vec![provider],
+            )
+            .await;
+        let elapsed = started.elapsed();
+        server.abort();
+
+        let error = match result {
+            Ok(_) => panic!("a hung upstream must not succeed"),
+            Err(failure) => failure.error,
+        };
+        assert!(matches!(error, ProxyError::Timeout(_)), "{error}");
+        assert!(elapsed < Duration::from_secs(10), "waited {elapsed:?}");
     }
 
     #[test]
