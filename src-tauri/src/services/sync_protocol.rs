@@ -2,7 +2,7 @@
 //!
 //! Shared by WebDAV, S3, and future transports. Artifact set: `db.sql` + `skills.zip`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::process::Command;
@@ -15,7 +15,9 @@ use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
 use crate::error::AppError;
-use crate::services::skill::{skill_state_read_guard, skill_state_write_guard};
+use crate::services::skill::{
+    skill_state_read_guard, skill_state_write_guard, SkillStorageLocation,
+};
 
 // Re-export archive functions for use by transport layers.
 pub(crate) use super::webdav_sync::archive::{
@@ -391,9 +393,23 @@ pub(crate) fn apply_snapshot(
     // are backed up/replaced and the corresponding database snapshot is applied.
     let _skill_state_guard = skill_state_write_guard();
     let skills_backup = backup_current_skills()?;
+    // In the shared folder (~/.agents/skills), Skills without a row here belong to other
+    // tools and were never part of the snapshot, so the restore keeps them (#6778, #7809).
+    let shared_folder =
+        crate::settings::get_skill_storage_location() == SkillStorageLocation::Unified;
+    let managed = if shared_folder {
+        Some(
+            db.get_all_installed_skills()?
+                .values()
+                .map(|skill| skill.directory.to_lowercase())
+                .collect::<HashSet<_>>(),
+        )
+    } else {
+        None
+    };
 
     // Replace skills first, then import database; roll back skills on DB failure.
-    restore_skills_zip(skills_zip)?;
+    restore_skills_zip(skills_zip, managed.as_ref())?;
 
     if let Err(db_err) = db.import_sql_string_for_sync(sql_str) {
         return Err(skills_backup.rollback_after_import_error(db_err));

@@ -7367,6 +7367,87 @@ mod tests {
         );
     }
 
+    fn skill_title(dir: &Path) -> Option<String> {
+        let text = fs::read_to_string(dir.join("SKILL.md")).ok()?;
+        text.lines().nth(1).map(str::to_string)
+    }
+
+    /// Snapshot of one managed Skill (`team-skill`) and, next to it, a `shared-name` folder that
+    /// has no row; then this machine edits both and another tool adds `other-tool-skill`.
+    fn restore_skills_fixture(db: &Arc<Database>) -> crate::services::sync_protocol::LocalSnapshot {
+        let mut managed = poisoned_skill("owner/repo:team-skill", "team-skill");
+        managed.apps = SkillApps::only(&AppType::Claude);
+        db.save_skill(&managed).expect("save managed skill");
+        let ssot = SkillService::get_ssot_dir().expect("ssot dir");
+        write_skill(&ssot.join("team-skill"), "team-skill from the snapshot");
+        write_skill(&ssot.join("shared-name"), "shared-name from the snapshot");
+        let snapshot = crate::services::sync_protocol::build_local_snapshot(db).expect("snapshot");
+
+        write_skill(&ssot.join("team-skill"), "local team-skill");
+        write_skill(&ssot.join("shared-name"), "local shared-name");
+        write_skill(&ssot.join("other-tool-skill"), "other-tool-skill");
+        fs::write(ssot.join("other-tool-skill").join("notes.md"), "my notes").expect("notes");
+        snapshot
+    }
+
+    /// #6778 / #7809: in the shared folder a restore keeps the Skills other tools put there
+    /// (no row here); the Skills CC Switch manages come from the snapshot.
+    #[test]
+    #[serial_test::serial]
+    fn sync_restore_keeps_unmanaged_skills_in_the_shared_folder() {
+        let home = tempdir().expect("home");
+        let _home = TestHomeGuard::set(home.path());
+        let _location = StorageLocationGuard::set(&_home, SkillStorageLocation::Unified);
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let ssot = SkillService::get_ssot_dir().expect("ssot dir");
+        assert!(ssot.starts_with(home.path().join(".agents")));
+        let snapshot = restore_skills_fixture(&db);
+
+        crate::services::sync_protocol::apply_snapshot(&db, &snapshot.db_sql, &snapshot.skills_zip)
+            .expect("restore snapshot");
+
+        assert_eq!(
+            skill_title(&ssot.join("team-skill")).as_deref(),
+            Some("name: team-skill from the snapshot")
+        );
+        assert_eq!(
+            fs::read_to_string(ssot.join("other-tool-skill").join("notes.md"))
+                .ok()
+                .as_deref(),
+            Some("my notes")
+        );
+        assert_eq!(
+            skill_title(&ssot.join("shared-name")).as_deref(),
+            Some("name: local shared-name")
+        );
+    }
+
+    /// The CC Switch folder stays snapshot-authoritative: folders without a row are replaced.
+    #[test]
+    #[serial_test::serial]
+    fn sync_restore_still_replaces_the_cc_switch_folder() {
+        let home = tempdir().expect("home");
+        let _home = TestHomeGuard::set(home.path());
+        let _location = StorageLocationGuard::set(&_home, SkillStorageLocation::CcSwitch);
+        let db = Arc::new(Database::memory().expect("memory db"));
+        let ssot = SkillService::get_ssot_dir().expect("ssot dir");
+        assert!(ssot.starts_with(home.path().join(".cc-switch")));
+        let snapshot = restore_skills_fixture(&db);
+
+        crate::services::sync_protocol::apply_snapshot(&db, &snapshot.db_sql, &snapshot.skills_zip)
+            .expect("restore snapshot");
+
+        assert_eq!(
+            skill_title(&ssot.join("team-skill")).as_deref(),
+            Some("name: team-skill from the snapshot")
+        );
+        assert!(!ssot.join("other-tool-skill").exists());
+        assert_eq!(
+            skill_title(&ssot.join("shared-name")).as_deref(),
+            Some("name: shared-name from the snapshot")
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn uninstall_backup_source_rejects_traversal_directory() {

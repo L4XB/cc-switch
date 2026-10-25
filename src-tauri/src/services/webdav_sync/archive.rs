@@ -69,7 +69,12 @@ pub(crate) fn zip_skills_ssot(dest_path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-pub(crate) fn restore_skills_zip(raw: &[u8]) -> Result<(), AppError> {
+/// With `managed` (the shared folder), live top-level entries whose lowercase name is not in
+/// it belong to other tools and are kept in the restored tree.
+pub(crate) fn restore_skills_zip(
+    raw: &[u8],
+    managed: Option<&HashSet<String>>,
+) -> Result<(), AppError> {
     let tmp = tempdir().map_err(|e| {
         io_context_localized(
             "webdav.sync.skills_extract_tmpdir_failed",
@@ -144,7 +149,7 @@ pub(crate) fn restore_skills_zip(raw: &[u8]) -> Result<(), AppError> {
             format!("Failed to resolve Skills SSOT directory: {e}"),
         )
     })?;
-    replace_skills_dir(Some(&extracted), &ssot, &RealSkillsFs)
+    replace_skills_dir_keeping(Some(&extracted), &ssot, &RealSkillsFs, managed)
 }
 
 // Keep filesystem failures injectable without touching process-global state in tests.
@@ -165,12 +170,21 @@ trait SkillsFs {
 struct RealSkillsFs;
 impl SkillsFs for RealSkillsFs {}
 
-/// Stage on the SSOT filesystem before moving live skills. Only this attempt's
-/// directory is ever cleaned up; an older recovery copy may be the only intact one.
 fn replace_skills_dir(
     source: Option<&Path>,
     ssot: &Path,
     operations: &impl SkillsFs,
+) -> Result<(), AppError> {
+    replace_skills_dir_keeping(source, ssot, operations, None)
+}
+
+/// Stage on the SSOT filesystem before moving live skills. Only this attempt's
+/// directory is ever cleaned up; an older recovery copy may be the only intact one.
+fn replace_skills_dir_keeping(
+    source: Option<&Path>,
+    ssot: &Path,
+    operations: &impl SkillsFs,
+    managed: Option<&HashSet<String>>,
 ) -> Result<(), AppError> {
     if let Some(source) = source {
         // copy_dir_recursive intentionally skips missing sources in other callers.
@@ -238,9 +252,47 @@ fn replace_skills_dir(
         }
     }
 
+    // The shared folder also holds other tools' Skills, which the snapshot never contained:
+    // move them into the restored tree before the old one goes. If a move fails, keep the
+    // whole transaction directory rather than delete what is left in it.
+    if let Some(managed) = managed.filter(|_| had_live && source.is_some()) {
+        if let Err(error) = keep_unmanaged_entries(&previous, ssot, managed, operations) {
+            log::warn!(
+                "[Sync] Keeping {} because moving unmanaged Skills back failed: {error}",
+                transaction.display()
+            );
+            return Ok(());
+        }
+    }
+
     // Files are committed. Cleanup failure must not report a failed restore and
     // cause apply_snapshot to skip the matching database import.
     cleanup_skills_transaction(&transaction, operations);
+    Ok(())
+}
+
+/// Moves the top-level entries of `previous` that no installed Skill claims into `ssot`;
+/// a same-named entry from the snapshot gives way to the local one.
+fn keep_unmanaged_entries(
+    previous: &Path,
+    ssot: &Path,
+    managed: &HashSet<String>,
+    operations: &impl SkillsFs,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(previous)? {
+        let entry = entry?;
+        if managed.contains(&entry.file_name().to_string_lossy().to_lowercase()) {
+            continue;
+        }
+        let target = ssot.join(entry.file_name());
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.is_dir() => operations.remove_dir_all(&target)?,
+            Ok(_) => fs::remove_file(&target)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        operations.rename(&entry.path(), &target)?;
+    }
     Ok(())
 }
 
